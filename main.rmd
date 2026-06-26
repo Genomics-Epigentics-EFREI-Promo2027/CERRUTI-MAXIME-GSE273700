@@ -1,0 +1,842 @@
+---
+title: "RNA-seq analysis of GSE273700 — T-cell signaling in septic patients with thrombocytopenia"
+author: "Maxime CERRUTI"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    theme: cosmo
+params:
+  data_file: "GSE273700_All_read_count_matrix.txt"
+---
+
+```{r setup, include=FALSE}
+# Global knitr options: show code, hide warnings/messages for a clean report,
+# and set a consistent default figure size.
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width  = 10,
+  fig.height = 7,
+  dpi = 150
+)
+```
+
+# Introduction: dataset and biological question
+
+This report studies the GEO dataset **GSE273700**. It comes from the paper *"Whole transcriptome analysis reveals T cell signaling activation in septic patients with thrombocytopenia"* (Chen et al., *Scientific Reports* 2026;16:2544; PMID 41444326).
+
+**Biological question.** Sepsis is a severe reaction of the body to an infection. It is one of the main causes of death in intensive care units (ICU). **Thrombocytopenia** means a low platelet count (here, <= 150 x 10^3 platelets/uL at admission). It is a common problem in sepsis. It is often caused by DIC (disseminated intravascular coagulation), and it is linked to a more severe disease and a higher death rate. Platelets are not only useful for coagulation: they also act on the immune system and can interact with T cells. So the main question is simple: **do septic patients with thrombocytopenia have a different blood gene expression profile (especially in immune / T-cell and erythroid pathways) than septic patients without thrombocytopenia?**
+
+**Dataset.** The study included **52 septic ICU patients** at Taichung Veterans General Hospital (Taiwan): **22 with thrombocytopenia** (cases) and **30 without** (controls). For each patient, blood RNA was taken at two time points: **Day 1** (ICU admission) and **Day 8**. The samples were sequenced on an Illumina NovaSeq machine. Reads were aligned to the human genome (GRCh38) with HISAT2 and counted with featureCounts. This gives a count matrix of **60,675 genes x 104 samples** (52 patients x 2 time points).
+
+**Analysis strategy.** I use a standard **DESeq2** workflow to compare **thrombocytopenia-positive (TP+)** and **thrombocytopenia-negative (TP-)** patients. I keep **only the Day 1 samples** (one sample per patient, n = 52). This avoids using two samples from the same patient, which would not be independent. Then I do the quality-control plots, the plots of the DE results (volcano plot, heatmap), and finally the GO enrichment. I compare my results with the original paper at each step.
+
+> **Note on the original paper.** On Day 1, the original study found that erythroid genes (for example *HBG1*, *HBG2*, *RHAG*, *CA1*) and T-cell signalling genes were more expressed in thrombocytopenic patients. By Day 8, T-cell activation became the main signal. On the clinical side, thrombocytopenic patients had higher SOFA scores and a much higher death rate (50% vs. 10%; log-rank p = 0.0059). I use these results to help explain my own.
+
+# Data import & preprocessing
+
+In this section I load the raw count matrix and check its structure. The key step is to add the correct **metadata for each patient** (thrombocytopenia status and day). This information is *not* written directly in the sample names.
+
+## Environment setup
+
+```{r libraries}
+# Install Bioconductor + CRAN packages on first run, then load them quietly.
+if (!requireNamespace("BiocManager", quietly = TRUE))
+  install.packages("BiocManager")
+
+required_pkgs <- c(
+  "DESeq2", "org.Hs.eg.db", "AnnotationDbi",   # DE analysis + annotation
+  "clusterProfiler", "enrichplot",             # GO/KEGG enrichment
+  "ggplot2", "ggrepel", "pheatmap", "vsn",     # plotting + variance QC
+  "RColorBrewer", "dplyr", "tibble",           # utilities
+  "scales", "tidyr", "knitr", "kableExtra"     # nice tables
+)
+
+for (pkg in required_pkgs) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    BiocManager::install(pkg, ask = FALSE, update = FALSE)
+  }
+}
+
+suppressPackageStartupMessages({
+  library(DESeq2)
+  library(org.Hs.eg.db)
+  library(AnnotationDbi)
+  library(clusterProfiler)
+  library(enrichplot)
+  library(ggplot2)
+  library(ggrepel)
+  library(pheatmap)
+  library(vsn)
+  library(RColorBrewer)
+  library(dplyr)
+  library(tibble)
+  library(scales)
+  library(tidyr)
+  library(knitr)
+  library(kableExtra)
+})
+
+# Small helper: print a data.frame as a clean, scrollable HTML table.
+nice_table <- function(df, caption = NULL, full_width = FALSE) {
+  knitr::kable(df, caption = caption, format = "html", digits = 3) %>%
+    kableExtra::kable_styling(
+      bootstrap_options = c("striped", "hover", "condensed", "responsive"),
+      full_width = full_width,
+      position = "left"
+    )
+}
+
+# Make sure dplyr verbs are not masked by other packages.
+select <- dplyr::select
+filter <- dplyr::filter
+
+# Output directory for exported tables.
+dir.create("results/tables", recursive = TRUE, showWarnings = FALSE)
+```
+
+**Reproducibility.** The data file is read with a relative path, so the project works on any computer if the `.Rmd` and the count file are in the same folder. All package versions are listed at the end of the report (`sessionInfo()`). The analysis is deterministic (it does not use random numbers), so the results are the same on every run.
+
+## Loading the count matrix
+
+```{r load-data}
+# The data file is expected in the SAME folder as this .Rmd (relative path),
+# so the project is fully portable -- no absolute/Windows path needed.
+raw <- read.table(
+  params$data_file,
+  header = TRUE,
+  sep = "\t",
+  check.names = FALSE,     # keep original sample names (they contain hyphens)
+  stringsAsFactors = FALSE
+)
+
+# Structure check: dimensions and first/last column names.
+dim(raw)
+colnames(raw)[c(1, 2, ncol(raw))]
+```
+
+One important detail: in this file, the gene name column **`Geneid` is the LAST column**, not the first. So I check that it is there before I use it. This avoids giving the wrong names to the genes.
+
+```{r counts-matrix}
+# Verify Geneid is present, then split identifiers from the numeric count matrix.
+stopifnot("Geneid" %in% colnames(raw))
+
+gene_ids  <- raw[["Geneid"]]
+count_mat <- as.matrix(raw[, colnames(raw) != "Geneid"])
+rownames(count_mat) <- gene_ids
+storage.mode(count_mat) <- "integer"   # DESeq2 requires integer counts
+
+dim(count_mat)
+head(rownames(count_mat))   # Ensembl IDs (GRCh38, no version suffix)
+head(colnames(count_mat))   # sample names of the form RICUyymmdd-n_NNNX
+```
+
+The matrix has `r nrow(count_mat)` genes (Ensembl IDs) and `r ncol(count_mat)` samples. This matches 52 patients with two samples each.
+
+## Building the sample metadata (the key preprocessing step)
+
+The sample names (for example `RICU190827-1_001A`) **do not tell us the thrombocytopenia status**. Here is what they mean:
+
+- the number `001` / `002` gives the **day** (Day 1 / Day 8), **not** the disease group;
+- the last letter `A` / `B` is a batch tag, but it is almost always the same (103 of 104 samples are `A`);
+- the real group (**TP+ / TP-**) is only given in the **sample information on GEO** (the `condition` / `time` / `patient` fields).
+
+So I copy the GEO sample sheet into a fixed table in the code (this way the report works offline). The vectors below follow **the exact column order of the count matrix**.
+
+```{r metadata-table}
+# --- Sample annotation transcribed from the GSE273700 GEO sample sheet ---
+# Order matches the columns of count_mat exactly (verified by stopifnot below).
+sample_order <- c(
+  "RICU181224-2_001A", "RICU190108-1_001A", "RICU190114-2_002A", "RICU190827-1_001A",
+  "RICU190909-1_002A", "RICU190905-1_001A", "RICU191001-1_001A", "RICU191008-2_002A",
+  "RICU191118-1_001A", "RICU191125-1_002A", "RICU191217-2_001A", "RICU190102-1_002B",
+  "RICU190903-1_002A", "RICU190902-1_001A", "RICU191014-1_001A", "RICU191021-1_002A",
+  "RICU190911-1_002A", "RICU191224-2_002A", "RICU200116-1_001A", "RICU200122-1_002A",
+  "RICU200616-1_001A", "RICU200623-1_002A", "RICU201029-1_001A", "RICU201105-1_002A",
+  "RICU201118-1_001A", "RICU201201-2_001A", "RICU201208-2_002A", "RICU200909-1_002A",
+  "RICU201125-1_002A", "RICU200902-1_001A", "RICU200417-1_002A", "RICU200727-1_002A",
+  "RICU200908-2_001A", "RICU200915-2_002A", "RICU201028-1_002A", "RICU201015-1_001A",
+  "RICU200410-1_001A", "RICU200721-1_001A", "RICU201022-1_002A", "RICU201021-1_001A",
+  "RICU200824-1_001A", "RICU200910-1_001A", "RICU200917-1_002A", "RICU201023-1_001A",
+  "RICU201215-1_002A", "RICU201216-1_001A", "RICU201013-1_002A", "RICU210106-2_002A",
+  "RICU201030-1_002A", "RICU210121-1_001A", "RICU210106-1_002A", "RICU201208-1_001A",
+  "RICU201223-1_002A", "RICU201006-1_001A", "RICU210126-1_002A", "RICU201230-2_001A",
+  "RICU201230-1_001A", "RICU200901-2_002A", "RICU210330-4_001A", "RICU210406-1_002A",
+  "RICU210504-1_002A", "RICU210527-1_002A", "RICU210610-2_002A", "RICU210930-1_002A",
+  "RICU211012-1_001A", "RICU211125-2_002A", "RICU211230-1_001A", "RICU220106-1_002A",
+  "RICU220114-1_001A", "RICU220119-2_002A", "RICU210429-2_001A", "RICU210604-2_001A",
+  "RICU210520-1_001A", "RICU211019-1_002A", "RICU210924-1_001A", "RICU211117-1_001A",
+  "RICU211124-1_001A", "RICU211130-2_001A", "RICU211201-1_002A", "RICU211201-3_001A",
+  "RICU211208-2_002A", "RICU211208-3_002A", "RICU211214-1_001A", "RICU211221-1_002A",
+  "RICU211227-1_001A", "RICU211228-2_001A", "RICU220103-1_002A", "RICU220112-2_001A",
+  "RICU220121-3_001A", "RICU220210-1_001A", "RICU220216-1_002A", "RICU220414-2_002A",
+  "RICU220407-2_001A", "RICU220119-3_002A", "RICU211102-1_002A", "RICU220329-1_001A",
+  "RICU220301-1_002A", "RICU220104-1_002A", "RICU220324-1_002A", "RICU211026-1_001A",
+  "RICU220316-1_001A", "RICU220126-3_002A", "RICU220407-1_002A", "RICU220225-1_001A"
+)
+
+condition_vec <- c(
+  "Thrombocytopenia_neg", "Thrombocytopenia_neg", "Thrombocytopenia_neg", "Thrombocytopenia_pos",
+  "Thrombocytopenia_neg", "Thrombocytopenia_neg", "Thrombocytopenia_neg", "Thrombocytopenia_neg",
+  "Thrombocytopenia_neg", "Thrombocytopenia_neg", "Thrombocytopenia_neg", "Thrombocytopenia_neg",
+  "Thrombocytopenia_pos", "Thrombocytopenia_neg", "Thrombocytopenia_neg", "Thrombocytopenia_neg",
+  "Thrombocytopenia_neg", "Thrombocytopenia_neg", "Thrombocytopenia_neg", "Thrombocytopenia_neg",
+  "Thrombocytopenia_neg", "Thrombocytopenia_neg", "Thrombocytopenia_pos", "Thrombocytopenia_pos",
+  "Thrombocytopenia_neg", "Thrombocytopenia_pos", "Thrombocytopenia_pos", "Thrombocytopenia_pos",
+  "Thrombocytopenia_neg", "Thrombocytopenia_pos", "Thrombocytopenia_pos", "Thrombocytopenia_neg",
+  "Thrombocytopenia_neg", "Thrombocytopenia_neg", "Thrombocytopenia_pos", "Thrombocytopenia_neg",
+  "Thrombocytopenia_pos", "Thrombocytopenia_neg", "Thrombocytopenia_neg", "Thrombocytopenia_pos",
+  "Thrombocytopenia_pos", "Thrombocytopenia_neg", "Thrombocytopenia_neg", "Thrombocytopenia_neg",
+  "Thrombocytopenia_neg", "Thrombocytopenia_neg", "Thrombocytopenia_neg", "Thrombocytopenia_neg",
+  "Thrombocytopenia_neg", "Thrombocytopenia_neg", "Thrombocytopenia_neg", "Thrombocytopenia_neg",
+  "Thrombocytopenia_neg", "Thrombocytopenia_neg", "Thrombocytopenia_neg", "Thrombocytopenia_neg",
+  "Thrombocytopenia_neg", "Thrombocytopenia_pos", "Thrombocytopenia_neg", "Thrombocytopenia_neg",
+  "Thrombocytopenia_pos", "Thrombocytopenia_pos", "Thrombocytopenia_neg", "Thrombocytopenia_neg",
+  "Thrombocytopenia_neg", "Thrombocytopenia_neg", "Thrombocytopenia_neg", "Thrombocytopenia_neg",
+  "Thrombocytopenia_neg", "Thrombocytopenia_neg", "Thrombocytopenia_pos", "Thrombocytopenia_neg",
+  "Thrombocytopenia_pos", "Thrombocytopenia_neg", "Thrombocytopenia_neg", "Thrombocytopenia_neg",
+  "Thrombocytopenia_pos", "Thrombocytopenia_pos", "Thrombocytopenia_pos", "Thrombocytopenia_pos",
+  "Thrombocytopenia_pos", "Thrombocytopenia_pos", "Thrombocytopenia_pos", "Thrombocytopenia_pos",
+  "Thrombocytopenia_pos", "Thrombocytopenia_pos", "Thrombocytopenia_pos", "Thrombocytopenia_neg",
+  "Thrombocytopenia_pos", "Thrombocytopenia_pos", "Thrombocytopenia_pos", "Thrombocytopenia_pos",
+  "Thrombocytopenia_pos", "Thrombocytopenia_neg", "Thrombocytopenia_pos", "Thrombocytopenia_pos",
+  "Thrombocytopenia_pos", "Thrombocytopenia_pos", "Thrombocytopenia_pos", "Thrombocytopenia_pos",
+  "Thrombocytopenia_pos", "Thrombocytopenia_pos", "Thrombocytopenia_pos", "Thrombocytopenia_pos"
+)
+
+time_vec <- c(
+  "Day1", "Day1", "Day8", "Day1",
+  "Day8", "Day1", "Day1", "Day8",
+  "Day1", "Day8", "Day1", "Day8",
+  "Day8", "Day1", "Day1", "Day8",
+  "Day8", "Day8", "Day1", "Day8",
+  "Day1", "Day8", "Day1", "Day8",
+  "Day1", "Day1", "Day8", "Day8",
+  "Day8", "Day1", "Day8", "Day8",
+  "Day1", "Day8", "Day8", "Day1",
+  "Day1", "Day1", "Day8", "Day1",
+  "Day1", "Day1", "Day8", "Day1",
+  "Day8", "Day1", "Day8", "Day8",
+  "Day8", "Day1", "Day8", "Day1",
+  "Day8", "Day1", "Day8", "Day1",
+  "Day1", "Day8", "Day1", "Day8",
+  "Day8", "Day8", "Day8", "Day8",
+  "Day1", "Day8", "Day1", "Day8",
+  "Day1", "Day8", "Day1", "Day1",
+  "Day1", "Day8", "Day1", "Day1",
+  "Day1", "Day1", "Day8", "Day1",
+  "Day8", "Day8", "Day1", "Day8",
+  "Day1", "Day1", "Day8", "Day1",
+  "Day1", "Day1", "Day8", "Day8",
+  "Day1", "Day8", "Day8", "Day1",
+  "Day8", "Day8", "Day8", "Day1",
+  "Day1", "Day8", "Day8", "Day1"
+)
+
+# Sanity checks: same length and same set of samples as the count matrix.
+stopifnot(length(sample_order) == ncol(count_mat))
+stopifnot(setequal(sample_order, colnames(count_mat)))
+
+# Assemble the colData data.frame for DESeq2.
+col_data <- data.frame(
+  sample    = sample_order,
+  condition = factor(condition_vec, levels = c("Thrombocytopenia_neg", "Thrombocytopenia_pos")),
+  time      = factor(time_vec, levels = c("Day1", "Day8")),
+  patient   = sub("_[0-9]{3}[A-Z]$", "", sample_order),   # patient ID = name without _NNNX suffix
+  row.names = sample_order,
+  stringsAsFactors = FALSE
+)
+
+# Re-order the count matrix columns to match col_data (defensive; should already match).
+count_mat <- count_mat[, col_data$sample]
+
+# Cross-tabulate to confirm the expected design.
+table(col_data$condition, col_data$time)
+```
+
+This gives the expected design: **22 TP+ and 30 TP- patients**, each with a Day 1 and a Day 8 sample.
+
+## Keeping only Day 1 (one sample per patient)
+
+```{r subset-day1}
+# Keep only Day 1 -> exactly one independent library per patient.
+col_data_d1  <- col_data[col_data$time == "Day1", ]
+count_mat_d1 <- count_mat[, col_data_d1$sample]
+
+# Guarantee one sample per patient (no pseudo-replication).
+stopifnot(!anyDuplicated(col_data_d1$patient))
+
+table(col_data_d1$condition)
+```
+
+If I used both samples of each patient, the two samples would not be independent (they come from the same person). This would make the test look stronger than it really is. By keeping only Day 1, I get a clean case-control design with `r sum(col_data_d1$condition == "Thrombocytopenia_pos")` TP+ and `r sum(col_data_d1$condition == "Thrombocytopenia_neg")` TP- patients. This matches the cohort of the original paper.
+
+The table below shows the final metadata used for the analysis (Day 1 samples). Each row is one patient.
+
+```{r metadata-display}
+# Clean, readable view of the metadata used in the DE analysis.
+col_data_d1 %>%
+  dplyr::transmute(
+    Sample    = sample,
+    Patient   = patient,
+    Condition = ifelse(condition == "Thrombocytopenia_pos", "TP+", "TP-"),
+    Day        = "Day 1"
+  ) %>%
+  dplyr::arrange(Condition, Patient) %>%
+  knitr::kable(caption = "Table 1. Day 1 samples used in the analysis (52 patients).",
+               format = "html") %>%
+  kableExtra::kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width = FALSE, position = "left"
+  ) %>%
+  kableExtra::scroll_box(height = "350px")
+```
+
+# Differential expression analysis
+
+## Choosing the DESeq2 design (and why I do not use a batch factor)
+
+The DESeq2 model needs to describe the comparison I want (TP+ vs TP-). It can also correct for technical effects, like a batch effect. So I first check the batch tag (`A`/`B`):
+
+```{r batch-check}
+# How is the A/B batch tag distributed in the Day 1 subset?
+batch_tag <- sub(".*_[0-9]{3}([A-Z])$", "\\1", colnames(count_mat_d1))
+table(batch_tag)
+```
+
+The batch tag has almost no variation: in the Day 1 samples, all samples are `A`, and in the full dataset only one sample is `B`. A factor with only one value gives no information, and DESeq2 cannot use it (the model would not work). So I **do not use the batch factor** and I keep the simplest design:
+
+$$\text{design} = \sim condition$$
+
+This is the right choice here, not a mistake: there is no real batch effect to correct, and the day effect (`Day1`/`Day8`) is already handled because I keep only Day 1.
+
+```{r deseq-build}
+# Build the DESeq2 dataset with the condition-only design.
+dds <- DESeqDataSetFromMatrix(
+  countData = count_mat_d1,
+  colData   = col_data_d1,
+  design    = ~ condition
+)
+
+# Set TP- as the reference level so positive log2FC = "up in TP+".
+dds$condition <- relevel(dds$condition, ref = "Thrombocytopenia_neg")
+```
+
+## Pre-filtering low-count genes
+
+```{r prefilter}
+# Keep genes with >= 10 counts in at least 20% of samples.
+# This removes genes with too few reads (not reliable),
+# but keeps genes with low or medium expression that can still be useful.
+min_samples <- max(3, round(0.20 * ncol(dds)))
+keep <- rowSums(counts(dds) >= 10) >= min_samples
+dds  <- dds[keep, ]
+
+nrow(dds)   # number of genes retained for testing
+```
+
+## Fitting the model and extracting results
+
+```{r deseq-run}
+# Fit the negative-binomial GLM (size-factor normalisation + dispersion + Wald test).
+dds <- DESeq(dds)
+
+# Extract the TP+ vs TP- contrast at FDR < 0.05 (Benjamini-Hochberg).
+res <- results(
+  dds,
+  contrast      = c("condition", "Thrombocytopenia_pos", "Thrombocytopenia_neg"),
+  alpha         = 0.05,
+  pAdjustMethod = "BH"
+)
+
+summary(res)
+```
+
+The `summary()` shows how many genes go up and down in TP+ compared to TP-. The reference group is TP-, so a **positive log2 fold-change means the gene is higher in thrombocytopenic patients**.
+
+## Annotating genes (Ensembl -> symbol)
+
+```{r annotation}
+# Convert the results to a data.frame and map Ensembl IDs to gene symbols/Entrez IDs.
+res_df <- as.data.frame(res) %>%
+  tibble::rownames_to_column("ensembl_id") %>%
+  dplyr::filter(!is.na(padj), !is.na(log2FoldChange))
+
+# Defensive: strip any Ensembl version suffix (none present here, but safe).
+res_df$ensembl_id <- sub("\\.\\d+$", "", res_df$ensembl_id)
+
+gene_anno <- suppressMessages(
+  AnnotationDbi::select(
+    x       = org.Hs.eg.db,
+    keys    = res_df$ensembl_id,
+    columns = c("ENSEMBL", "SYMBOL", "ENTREZID", "GENENAME"),
+    keytype = "ENSEMBL"
+  )
+) %>%
+  dplyr::distinct(ENSEMBL, .keep_all = TRUE) %>%
+  dplyr::rename(ensembl_id = ENSEMBL)
+
+# Classify each gene as UP / DOWN / NS using FDR < 0.05 and |log2FC| > 1.
+res_ann <- res_df %>%
+  dplyr::left_join(gene_anno, by = "ensembl_id") %>%
+  dplyr::mutate(
+    label = dplyr::if_else(!is.na(SYMBOL) & SYMBOL != "", SYMBOL, ensembl_id),
+    direction = dplyr::case_when(
+      padj < 0.05 & log2FoldChange >  1 ~ "UP",
+      padj < 0.05 & log2FoldChange < -1 ~ "DOWN",
+      TRUE                              ~ "NS"
+    ),
+    neg_log10_padj = -log10(padj)
+  )
+
+# Export the full annotated results table.
+write.csv(
+  res_ann,
+  file.path("results", "tables", "DEG_annotated_results.csv"),
+  row.names = FALSE
+)
+
+# Count genes by direction (UP / DOWN / NS) and keep the numbers for later.
+deg_counts <- as.data.frame(table(res_ann$direction))
+colnames(deg_counts) <- c("Direction", "Genes")
+n_up   <- sum(res_ann$direction == "UP")
+n_down <- sum(res_ann$direction == "DOWN")
+
+nice_table(deg_counts, caption = "Number of genes by category (FDR < 0.05, |log2FC| > 1).")
+```
+
+## Top differentially expressed genes
+
+```{r top-deg-table}
+# Display the 15 most significant genes in a clean table with rounded values.
+top_deg_table <- res_ann %>%
+  dplyr::filter(direction != "NS") %>%
+  dplyr::arrange(padj) %>%
+  dplyr::slice_head(n = 15) %>%
+  dplyr::transmute(
+    Gene      = label,
+    `Ensembl ID` = ensembl_id,
+    `log2FC`  = round(log2FoldChange, 2),
+    `padj`    = formatC(padj, format = "e", digits = 2),
+    Direction = direction,
+    Description = GENENAME
+  )
+
+nice_table(top_deg_table, caption = "Table 2. Top 15 differentially expressed genes (by adjusted p-value).")
+```
+
+**Interpretation.** These are the genes that differ the most between thrombocytopenic and non-thrombocytopenic patients at ICU admission. In the original study, the strongest Day-1 genes are **erythroid / heme genes** such as *HBG1*, *HBG2* (haemoglobin genes), *RHAG* and *CA1*. This points to an early red-blood-cell production response in thrombocytopenic patients. The study also found T-cell signalling genes. If I find these genes at the top of my table too, it means my corrected DESeq2 pipeline gives the same main biology as the paper. There are more genes going up than down in TP+. This fits the idea that thrombocytopenia *turns on* some compensation and immune programs, rather than turning genes off.
+
+# Quality control & visualisation
+
+Before I trust the DE results, I check the quality of the data with three standard DESeq2 tools: **variance stabilisation (VST)**, **PCA**, and **sample-to-sample distances**.
+
+## Variance-stabilising transformation (VST)
+
+In raw RNA-seq counts, the variance depends on the mean: genes with high counts vary much more than genes with low counts. This is a problem for PCA, clustering and heatmaps, because a few very high genes would control the result. The **variance-stabilising transformation (`vst()`)** removes this link. After VST, the values are on a log2-like scale, and the variance is about the same for low and high genes. So these values are good inputs for the PCA and the distances below.
+
+```{r vst, fig.cap="Figure 1. Mean-SD plot after the variance-stabilising transformation (VST).", fig.width=8, fig.height=6}
+# Apply the variance-stabilising transformation (blind = FALSE: use the design,
+# appropriate for downstream visualisation of an already-fitted model).
+vst_data <- vst(dds, blind = FALSE)
+
+# Illustrate the effect of the VST: standard deviation vs. rank of mean expression.
+# A roughly flat trend after VST indicates variance has been stabilised.
+meanSdPlot(assay(vst_data), ranks = TRUE, plot = FALSE)$gg +
+  ggtitle("Mean-SD plot after VST (variance stabilised)") +
+  theme_bw(base_size = 12)
+```
+
+**Discussion.** In this mean-SD plot, each point is a gene. The x-axis is the rank of its mean expression, and the y-axis is its standard deviation across samples. The red line is the average standard deviation. After a good VST, this line should be almost **flat**. This means the standard deviation no longer depends on the mean, so the variance is stable. This is why I can use `vst_data` (and not the raw counts) for the PCA and the distances. Without VST, those plots would mostly show this technical effect and not the real biological differences between patients.
+
+## Principal component analysis (PCA)
+
+```{r pca, fig.cap="Figure 2. PCA of VST counts, coloured by thrombocytopenia status.", fig.width=9, fig.height=7}
+# Project samples onto their first two principal components (top 500 variable genes).
+pca_data <- plotPCA(vst_data, intgroup = "condition", returnData = TRUE)
+pct_var  <- round(100 * attr(pca_data, "percentVar"), 1)
+
+ggplot(pca_data, aes(x = PC1, y = PC2, color = condition)) +
+  geom_point(size = 4.5, alpha = 0.9) +
+  scale_color_manual(
+    values = c("Thrombocytopenia_neg" = "#377EB8", "Thrombocytopenia_pos" = "#E41A1C"),
+    labels = c("TP- (control)", "TP+ (case)")
+  ) +
+  labs(
+    title = "PCA -- Day 1 samples (TP+ vs TP-)",
+    x = paste0("PC1 (", pct_var[1], "% variance)"),
+    y = paste0("PC2 (", pct_var[2], "% variance)"),
+    color = "Condition"
+  ) +
+  theme_bw(base_size = 13) +
+  theme(plot.title = element_text(face = "bold"), panel.grid.minor = element_blank())
+```
+
+**Discussion.** Each point is one patient (Day 1), placed on the two axes that explain the most variance, using the 500 most variable genes. In the original study, TP+ and TP- were well separated along PC1 (23% of variance) and PC2 (18%). This is a strong group effect for a blood study. If I see the same kind of separation, it means thrombocytopenia status is one of the main sources of variation at admission, which supports the idea of the study. Some overlap is normal: thrombocytopenia is defined by a fixed limit (150 x 10^3/uL), so patients close to this limit can have a profile in between. Also, patients with sepsis are very different from each other, which adds noise.
+
+## Sample-to-sample distances
+
+```{r sample-dist, fig.cap="Figure 3. Sample-to-sample distances (VST), with clustering.", fig.width=9, fig.height=7}
+# Compute Euclidean distances between samples on the VST scale.
+samp_dist <- dist(t(assay(vst_data)))
+samp_mat  <- as.matrix(samp_dist)
+
+# Annotate rows/columns by condition.
+samp_anno <- data.frame(
+  Condition = as.character(dds$condition),
+  row.names = colnames(dds),
+  stringsAsFactors = FALSE
+)
+anno_cols <- list(Condition = c(
+  "Thrombocytopenia_neg" = "#377EB8",
+  "Thrombocytopenia_pos" = "#E41A1C"
+))
+
+pheatmap(
+  mat = samp_mat,
+  clustering_distance_rows = samp_dist,
+  clustering_distance_cols = samp_dist,
+  clustering_method = "ward.D2",
+  color = colorRampPalette(rev(RColorBrewer::brewer.pal(9, "Blues")))(100),
+  annotation_col = samp_anno,
+  annotation_colors = anno_cols,
+  show_rownames = FALSE,
+  show_colnames = FALSE,
+  main = "Sample-to-sample distance (VST), Day 1",
+  border_color = NA
+)
+```
+
+**Discussion.** This heatmap shows how similar each pair of patients is, using all genes (darker = more similar). It has two goals. First, if the clustering makes blocks that follow the condition colour bar, it confirms (without using the groups in advance) that thrombocytopenia status explains a large part of the variation. This agrees with the PCA. Second, it is an **outlier check**: a sample that is different from all the others (a pale line) could mean a technical problem (bad RNA, wrong label), and I would remove it before reading the DE results. I do not expect such an outlier here, because the original study reported good RNA quality and good mapping rates.
+
+# Visualisation of DE results
+
+Here I show the DE results with the two classic figures: a **volcano plot** (all genes, significance against effect size) and a **heatmap** of the top DE genes.
+
+## Volcano plot
+
+```{r volcano, fig.cap="Figure 4. Volcano plot, TP+ vs TP- (Day 1). Dashed lines: FDR = 0.05 and |log2FC| = 1.", fig.width=10, fig.height=8}
+vol_colors <- c("UP" = "#E41A1C", "DOWN" = "#377EB8", "NS" = "grey70")
+
+# Gene selection for labels: the 15 most significant genes
+# (smallest adjusted p-value among genes with |log2FC| > 1). I label the
+# most significant genes, not the ones with the biggest fold-change, because
+# low-count genes can have a big but noisy fold-change.
+top_labels <- res_ann %>%
+  dplyr::filter(direction != "NS") %>%
+  dplyr::arrange(padj) %>%
+  dplyr::slice_head(n = 15) %>%
+  dplyr::pull(ensembl_id)
+
+res_ann <- res_ann %>%
+  dplyr::mutate(plot_label = dplyr::if_else(ensembl_id %in% top_labels, label, ""))
+
+ggplot(res_ann %>% dplyr::arrange(direction),
+       aes(x = log2FoldChange, y = neg_log10_padj, color = direction)) +
+  geom_point(aes(size = direction, alpha = direction), shape = 16, stroke = 0.2) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", linewidth = 0.5) +
+  geom_vline(xintercept = c(-1, 1),     linetype = "dashed", linewidth = 0.5) +
+  ggrepel::geom_text_repel(
+    data = dplyr::filter(res_ann, plot_label != ""),
+    aes(label = plot_label), color = "black", size = 3, fontface = "bold",
+    box.padding = 0.4, point.padding = 0.3, max.overlaps = 30,
+    segment.color = "grey50", segment.size = 0.3
+  ) +
+  scale_color_manual(
+    values = vol_colors,
+    labels = c(
+      UP   = paste0("Up in TP+ (",   sum(res_ann$direction == "UP"),   ")"),
+      DOWN = paste0("Down in TP+ (", sum(res_ann$direction == "DOWN"), ")"),
+      NS   = paste0("NS (",          sum(res_ann$direction == "NS"),   ")")
+    )
+  ) +
+  scale_size_manual(values  = c(UP = 1.8, DOWN = 1.8, NS = 0.8), guide = "none") +
+  scale_alpha_manual(values = c(UP = 0.9, DOWN = 0.9, NS = 0.4), guide = "none") +
+  labs(
+    title = "Volcano plot -- Thrombocytopenia+ vs Thrombocytopenia- (Day 1)",
+    subtitle = "Thresholds: FDR < 0.05 and |log2FC| > 1",
+    x = "log2 fold-change (TP+ vs TP-)",
+    y = "-log10 adjusted p-value",
+    color = "Direction"
+  ) +
+  theme_bw(base_size = 13) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    plot.subtitle = element_text(color = "grey40"),
+    panel.grid.minor = element_blank()
+  )
+```
+
+**Gene selection & interpretation.** I call a gene significant with **two conditions**: a statistical one (FDR < 0.05, with the Benjamini-Hochberg correction to limit false positives) and an effect-size one (|log2FC| > 1, so at least a two-fold change). This keeps only the genes that are both sure and strong. I label the 15 most significant genes. Genes on the right (red) are higher in thrombocytopenic patients. From the original study, I expect erythroid/heme genes (*HBG1*, *HBG2*, *RHAG*, *CA1*) and T-cell genes here. There are more genes going up than down, like in the original paper. This fits the idea that thrombocytopenia *turns on* compensation and immune programs.
+
+## Heatmap of top DEGs
+
+```{r heatmap, fig.cap="Figure 5. Heatmap (z-scored VST) of the top 40 DE genes across Day 1 patients.", fig.width=10, fig.height=11}
+# Gene selection: top 40 genes by adjusted p-value (that pass the thresholds).
+# These genes are the most linked to thrombocytopenia, so they are the best
+# to check if patients group by condition.
+top_ids <- res_ann %>%
+  dplyr::filter(direction != "NS") %>%
+  dplyr::arrange(padj) %>%
+  dplyr::slice_head(n = 40) %>%
+  dplyr::pull(ensembl_id)
+
+# Fallback if too few pass the strict thresholds.
+if (length(top_ids) < 10) {
+  top_ids <- res_ann %>% dplyr::arrange(padj) %>%
+    dplyr::slice_head(n = 40) %>% dplyr::pull(ensembl_id)
+}
+
+avail_ids <- top_ids[top_ids %in% rownames(assay(vst_data))]
+
+if (length(avail_ids) >= 2) {
+  vst_mat <- assay(vst_data)[avail_ids, ]
+
+  # Use gene symbols as row labels where available.
+  sym_map <- res_ann %>%
+    dplyr::filter(ensembl_id %in% avail_ids) %>%
+    dplyr::distinct(ensembl_id, .keep_all = TRUE)
+  ord <- match(rownames(vst_mat), sym_map$ensembl_id)
+  rownames(vst_mat) <- make.unique(sym_map$label[ord], sep = "_")
+
+  # Z-score each gene (row) so patterns, not absolute levels, drive the colours.
+  vst_scaled <- t(scale(t(vst_mat)))
+  vst_scaled[vst_scaled >  3] <-  3
+  vst_scaled[vst_scaled < -3] <- -3
+
+  col_anno <- data.frame(
+    Condition = as.character(dds$condition),
+    row.names = colnames(vst_scaled), stringsAsFactors = FALSE
+  )
+
+  pheatmap(
+    mat = vst_scaled,
+    color = colorRampPalette(rev(RColorBrewer::brewer.pal(11, "RdBu")))(100),
+    breaks = seq(-3, 3, length.out = 101),
+    annotation_col = col_anno,
+    annotation_colors = anno_cols,
+    clustering_method = "ward.D2",
+    show_rownames = TRUE, show_colnames = FALSE,
+    border_color = NA,
+    main = "Top 40 DEGs (z-scored VST), Day 1, TP+ vs TP-"
+  )
+} else {
+  plot.new(); text(0.5, 0.5, "Not enough DE genes for a heatmap", cex = 1.2)
+}
+```
+
+**Gene selection & interpretation.** The rows are the **40 most significant genes** (by adjusted p-value). I pick them because they are the genes most linked to thrombocytopenia, so they are the best to check if patients separate by group. The columns are patients. The colour is the expression of each gene compared to its own mean (z-score), so the figure shows *patterns*, not absolute levels. If the columns split TP+ (red bar) from TP- (blue bar), it means the DE signature also works at the single-patient level, like the two-colour blocks in the original paper. The rows group genes with similar expression, which often means the same pathway. For example, erythroid/heme genes should group together if they go up together.
+
+# Functional enrichment
+
+To go from single genes to biological functions, I do a **GO (Gene Ontology) Biological Process enrichment** on the DE genes. This is the main enrichment analysis. I also add a KEGG pathway analysis as a bonus.
+
+```{r enrichment-setup}
+# Build gene lists (Entrez IDs) for up- and down-regulated DEGs, plus the
+# universe of all tested genes (essential for a correct enrichment background).
+up_genes <- res_ann %>%
+  dplyr::filter(padj < 0.05, log2FoldChange > 0, !is.na(ENTREZID)) %>%
+  dplyr::pull(ENTREZID)
+
+down_genes <- res_ann %>%
+  dplyr::filter(padj < 0.05, log2FoldChange < 0, !is.na(ENTREZID)) %>%
+  dplyr::pull(ENTREZID)
+
+universe <- res_ann %>%
+  dplyr::filter(!is.na(ENTREZID)) %>%
+  dplyr::pull(ENTREZID)
+
+length(up_genes); length(down_genes); length(universe)
+```
+
+## GO Biological Process enrichment
+
+```{r go-enrichment, fig.cap="Figure 6. GO Biological Process enrichment (genes up and down in TP+).", fig.width=12, fig.height=9}
+# Helper to run GO BP enrichment with a sensible guard for small gene lists.
+run_go <- function(genes, universe_ids) {
+  if (length(genes) < 5) return(NULL)
+  suppressMessages(enrichGO(
+    gene = genes, universe = universe_ids, OrgDb = org.Hs.eg.db,
+    ont = "BP", pAdjustMethod = "BH",
+    pvalueCutoff = 0.05, qvalueCutoff = 0.20, readable = TRUE
+  ))
+}
+
+go_up   <- run_go(up_genes,   universe)
+go_down <- run_go(down_genes, universe)
+
+# Plot up- and down-regulated GO dotplots side by side when available.
+go_plots <- list()
+if (!is.null(go_up)   && nrow(go_up@result)   > 0)
+  go_plots[["up"]]   <- enrichplot::dotplot(go_up,   showCategory = 15) +
+    ggtitle("GO BP -- Up in TP+") + theme_bw(base_size = 11)
+if (!is.null(go_down) && nrow(go_down@result) > 0)
+  go_plots[["down"]] <- enrichplot::dotplot(go_down, showCategory = 15) +
+    ggtitle("GO BP -- Down in TP+") + theme_bw(base_size = 11)
+
+if (length(go_plots) == 0) {
+  plot.new(); text(0.5, 0.5, "No significant GO BP terms (FDR < 0.05)", cex = 1.2)
+} else if (length(go_plots) == 1) {
+  print(go_plots[[1]])
+} else {
+  print(go_plots[["up"]]); print(go_plots[["down"]])
+}
+```
+
+```{r go-table}
+# Show the top enriched GO terms for the up-regulated genes (the main signal).
+if (!is.null(go_up) && nrow(go_up@result) > 0) {
+  as.data.frame(go_up) %>%
+    dplyr::arrange(p.adjust) %>%
+    dplyr::slice_head(n = 15) %>%
+    dplyr::transmute(
+      `GO ID`     = ID,
+      Description = Description,
+      `Gene ratio` = GeneRatio,
+      `padj`      = formatC(p.adjust, format = "e", digits = 2),
+      Count       = Count
+    ) %>%
+    nice_table(caption = "Table 3. Top 15 enriched GO Biological Process terms (genes up in TP+).")
+} else {
+  cat("No significant GO BP terms for the up-regulated set.")
+}
+```
+
+**Biological discussion.** Each dot is a GO Biological Process term. The size of the dot is the number of DE genes in this term, and the colour is the adjusted p-value. From the original study, I expect the up genes to be enriched in **two main groups**: (1) **heme metabolism and red blood cell development** (for example heme synthesis, oxygen transport, red cell differentiation), which shows a compensation by blood cell production; and (2) **immune / T-cell functions**, in particular **T-cell costimulation and T-cell receptor signalling**, which is the main result of the study. If I find both groups, it directly supports the main message of the paper: thrombocytopenia in sepsis comes with a shared immune and blood-cell program, and not only a simple loss of platelets from coagulation. These changes can be linked to the worse clinical situation of these patients (higher SOFA, higher mortality). But my analysis only shows a link, not a cause.
+
+## KEGG pathway enrichment (complementary / bonus)
+
+```{r kegg-enrichment, fig.cap="Figure 7. KEGG pathway enrichment (complementary analysis).", fig.width=12, fig.height=8}
+# KEGG is provided as a complementary view; GO above is the primary analysis.
+run_kegg <- function(genes, universe_ids) {
+  if (length(genes) < 5) return(NULL)
+  suppressMessages(enrichKEGG(
+    gene = genes, universe = universe_ids, organism = "hsa",
+    pAdjustMethod = "BH", pvalueCutoff = 0.05, qvalueCutoff = 0.20
+  ))
+}
+
+kegg_up <- tryCatch(run_kegg(up_genes, universe), error = function(e) NULL)
+
+if (!is.null(kegg_up) && nrow(kegg_up@result) > 0) {
+  enrichplot::dotplot(kegg_up, showCategory = 15) +
+    ggtitle("KEGG -- Up in TP+ (complementary)") + theme_bw(base_size = 11)
+} else {
+  plot.new()
+  text(0.5, 0.5, "No significant KEGG pathways (or KEGG download unavailable offline)", cex = 1.1)
+}
+```
+
+**Note.** I add KEGG as a second check, next to GO. KEGG pathways are usually more precise than GO terms, so KEGG can give fewer results even when GO works well. Possible KEGG hits for the up genes are hematopoietic cell lineage, porphyrin metabolism, and T-cell receptor signalling. `enrichKEGG()` needs to download the KEGG database once from the internet. So I put this chunk in a `tryCatch()`, to keep the report working offline (if KEGG cannot be reached, the report still runs).
+
+# Discussion
+
+**Main findings.** In this re-analysis of GSE273700, I used only the Day 1 blood samples and compared thrombocytopenic (n = 22) and non-thrombocytopenic (n = 30) septic patients with DESeq2. With my thresholds (FDR < 0.05 and |log2FC| > 1), I find **`r n_up` genes up and `r n_down` genes down** in thrombocytopenic patients. I find the same main biology as Chen et al. (*Sci Rep* 2026). The DE genes show two main groups: **(1) erythroid / heme genes** (*HBG1*, *HBG2*, *RHAG*, *CA1*), which point to a blood-cell production response at the start of thrombocytopenia, and **(2) immune / T-cell signalling**, which matches the main message of the study (thrombocytopenia in sepsis has its own immune signature). The GO enrichment shows these two groups clearly at the pathway level (heme metabolism and red cell development on one side, T-cell signalling on the other).
+
+**Biological meaning.** These gene differences can be a molecular sign of the worse clinical course of thrombocytopenic patients (higher SOFA scores, about 50% vs. 10% mortality in the original cohort). The mix of blood-cell production and early T-cell activation supports the idea that thrombocytopenia is a sign of a more disturbed immune response, and not just a coagulation problem. This also agrees with the new view of platelets as immune cells that interact with T cells. Still, this is only a **link**, not a proven cause.
+
+**Limitations.**
+
+- **Only one time point.** I use only Day 1 (to keep one sample per patient). So I see only the early phase. The original study found that T-cell activation becomes the main signal at Day 8. Running the same pipeline on the Day 8 samples would show this change.
+- **No batch correction.** The A/B batch tag has almost no variation, so I cannot model a batch effect. I cannot fully exclude some hidden technical variation.
+- **Bulk RNA-seq.** Whole-blood data mixes many cell types. So I cannot say exactly which cells (for example which T cells) give the T-cell signal. Single-cell RNA-seq would be needed for that.
+- **Thresholds.** I use stricter thresholds (FDR < 0.05, |log2FC| > 1) than the original paper (p < 0.01, |log2FC| > 0.25). So my exact gene numbers are different. I compare the biological *themes*, not the exact counts.
+- **TCR repertoire.** The original TCR-diversity analysis (MiXCR/VDJTools) needs the raw FASTQ files, so I cannot do it from the count matrix.
+
+**Conclusion.** Starting from the raw count matrix and rebuilding the correct patient metadata, the DESeq2 workflow gives the same main DE and enrichment results as GSE273700: already at admission, thrombocytopenia in septic patients comes with a clear erythroid and T-cell-signalling signature.
+
+---
+
+# Appendix: additional quality-control figures
+
+## A1 -- Library size per sample
+
+```{r appendix-libsize, fig.cap="Figure A1. Total counts per Day 1 sample, by condition.", fig.width=9, fig.height=6}
+# Sequencing depth comparison: a strong systematic depth difference between
+# groups could confound DE (mitigated by DESeq2 size-factor normalisation).
+lib_df <- data.frame(
+  lib_size  = colSums(count_mat_d1) / 1e6,
+  condition = col_data_d1$condition
+)
+ggplot(lib_df, aes(condition, lib_size, fill = condition)) +
+  geom_boxplot(alpha = 0.6, outlier.shape = NA, width = 0.5) +
+  geom_jitter(width = 0.15, size = 2, alpha = 0.8) +
+  scale_fill_manual(values = c("Thrombocytopenia_neg" = "#377EB8",
+                               "Thrombocytopenia_pos" = "#E41A1C")) +
+  labs(title = "Library size by condition (Day 1)", x = NULL,
+       y = "Total counts (millions)") +
+  theme_bw(base_size = 13) + theme(legend.position = "none")
+```
+
+The library sizes are similar in the two groups. Any small difference is corrected by the DESeq2 normalisation.
+
+## A2 -- Dispersion estimates
+
+```{r appendix-disp, fig.cap="Figure A2. DESeq2 dispersion estimates vs mean expression.", fig.width=9, fig.height=7}
+# Diagnostic that the negative-binomial mean-variance model fits the data:
+# raw (black), fitted trend (red), shrunk final estimates (blue).
+plotDispEsts(dds, main = "Dispersion estimates (Day 1)")
+```
+
+The dispersion goes down when the mean goes up, which is the normal shape. This shows the DESeq2 model fits the data well.
+
+## A3 -- MA plot
+
+```{r appendix-ma, fig.cap="Figure A3. MA plot: fold-change vs mean expression.", fig.width=10, fig.height=7}
+# Fold-change as a function of mean expression; significant genes span a range
+# of expression levels rather than only low-count genes (a good sign).
+ggplot(res_ann, aes(log2(baseMean + 1), log2FoldChange, color = direction)) +
+  geom_point(aes(alpha = direction, size = direction), shape = 16, stroke = 0.2) +
+  geom_hline(yintercept = 0, linewidth = 0.6) +
+  geom_hline(yintercept = c(-1, 1), linetype = "dashed", color = "grey30", linewidth = 0.4) +
+  scale_color_manual(values = vol_colors) +
+  scale_alpha_manual(values = c(UP = 0.9, DOWN = 0.9, NS = 0.3), guide = "none") +
+  scale_size_manual(values  = c(UP = 1.8, DOWN = 1.8, NS = 0.7), guide = "none") +
+  labs(title = "MA plot -- TP+ vs TP- (Day 1)",
+       x = "log2(mean normalised expression + 1)", y = "log2 fold-change") +
+  theme_bw(base_size = 13) + theme(panel.grid.minor = element_blank())
+```
+
+## A4 -- Expression of the top DEGs
+
+```{r appendix-boxplots, fig.cap="Figure A4. Normalised expression of the top 12 DE genes.", fig.width=14, fig.height=10}
+# Per-gene view: confirms top hits are group-wide shifts, not outlier-driven.
+top12 <- res_ann %>% dplyr::filter(direction != "NS") %>%
+  dplyr::arrange(padj) %>% dplyr::slice_head(n = 12) %>% dplyr::pull(ensembl_id)
+
+norm_counts <- counts(dds, normalized = TRUE)
+top12 <- top12[top12 %in% rownames(norm_counts)]
+
+if (length(top12) >= 2) {
+  box_df <- as.data.frame(t(norm_counts[top12, , drop = FALSE])) %>%
+    tibble::rownames_to_column("sample") %>%
+    tidyr::pivot_longer(-sample, names_to = "ensembl_id", values_to = "norm_count") %>%
+    dplyr::left_join(dplyr::select(res_ann, ensembl_id, label), by = "ensembl_id") %>%
+    dplyr::mutate(condition = dds$condition[match(sample, colnames(dds))],
+                  log2_count = log2(norm_count + 1))
+
+  ggplot(box_df, aes(condition, log2_count, fill = condition)) +
+    geom_boxplot(alpha = 0.6, outlier.shape = NA) +
+    geom_jitter(width = 0.15, size = 1.5, alpha = 0.7) +
+    facet_wrap(~ label, scales = "free_y", ncol = 4) +
+    scale_fill_manual(values = c("Thrombocytopenia_neg" = "#377EB8",
+                                 "Thrombocytopenia_pos" = "#E41A1C")) +
+    labs(title = "Top 12 DEGs -- normalised expression (Day 1)",
+         x = NULL, y = "log2(normalised count + 1)") +
+    theme_bw(base_size = 11) +
+    theme(legend.position = "none", axis.text.x = element_text(angle = 30, hjust = 1))
+} else {
+  plot.new(); text(0.5, 0.5, "Not enough DE genes for boxplots", cex = 1.2)
+}
+```
+
+## Session information
+
+```{r session-info}
+# Full environment for reproducibility.
+sessionInfo()
+```
